@@ -72,3 +72,9 @@ ingenia_j0_bridge:
     collapsed_action_max_segments: 7
     pvt_segment_max_time_units: 60000
     completion_min_duration_fraction: 0.95
+    # Rolling FIFO streamer for dense MoveIt trajectories.
+    pvt_streaming_enabled: true
+    pvt_fifo_capacity: 16
+    pvt_fifo_target_fill: 10
+    pvt_fifo_low_watermark: 4
+    pvt_stream_max_append_per_cycle: 4

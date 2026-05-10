@@ -314,6 +314,12 @@ class IngeniaJointBridge(Node):
         self.declare_parameter("collapsed_action_max_segments", 7)
         self.declare_parameter("pvt_segment_max_time_units", 60000)
         self.declare_parameter("completion_min_duration_fraction", 0.95)
+        # Rolling FIFO streamer (Buffered PVT flow control).
+        self.declare_parameter("pvt_streaming_enabled", False)
+        self.declare_parameter("pvt_fifo_capacity", 16)
+        self.declare_parameter("pvt_fifo_target_fill", 10)
+        self.declare_parameter("pvt_fifo_low_watermark", 4)
+        self.declare_parameter("pvt_stream_max_append_per_cycle", 4)
         # Hardware execution can lag the nominal MoveIt/TOTG duration because this
         # bridge must arm PVT, queue segments, and wait for actual position/buffer drain.
         # Budget = max(requested_duration * scaling + margin, min_timeout).
@@ -836,25 +842,46 @@ class IngeniaJointBridge(Node):
                 self._send_ipm_segment(lead)
                 time.sleep(inter)
 
-                for pt in points:
-                    self._send_ipm_segment(pt)
-                    time.sleep(inter)
-
                 final_qc = points[-1].position_qc
                 self.last_hold_qc = final_qc
-
                 hold = IPMPoint(
                     position_qc=final_qc, velocity_rev_s=0.0,
                     time_units=self._seconds_to_time_units(0.04),
                 )
-                for _ in range(8):
-                    if self.cancel_requested.is_set():
-                        self.get_logger().warning("Cancel requested before PVT manager start; halting")
-                        self._halt_pvt()
-                        self._set_bridge_state(BridgeState.IPM_ARMED, "trajectory canceled before start")
-                        return False
-                    self._send_ipm_segment(hold)
-                    time.sleep(inter)
+
+                # Build the full record list to send: trajectory + trailing holds.
+                # In streaming mode, the wait loop tops up the FIFO as it drains;
+                # in blast mode (legacy) we queue every record before starting.
+                stream_records = list(points) + [hold] * 8
+                stream_enabled = bool(self.get_parameter("pvt_streaming_enabled").value)
+                fifo_target = int(self.get_parameter("pvt_fifo_target_fill").value)
+
+                if stream_enabled and len(stream_records) > fifo_target:
+                    pidx = 0
+                    prefill_n = min(fifo_target, len(stream_records))
+                    for i in range(prefill_n):
+                        if self.cancel_requested.is_set():
+                            self.get_logger().warning("Cancel requested before PVT manager start; halting")
+                            self._halt_pvt()
+                            self._set_bridge_state(BridgeState.IPM_ARMED, "trajectory canceled before start")
+                            return False
+                        self._send_ipm_segment(stream_records[i])
+                        time.sleep(inter)
+                    pidx = prefill_n
+                    self.get_logger().info(
+                        f"FIFO pre-fill: queued {prefill_n}/{len(stream_records)} records "
+                        f"({len(points)} traj + {len(stream_records) - len(points)} hold)"
+                    )
+                else:
+                    for rec in stream_records:
+                        if self.cancel_requested.is_set():
+                            self.get_logger().warning("Cancel requested before PVT manager start; halting")
+                            self._halt_pvt()
+                            self._set_bridge_state(BridgeState.IPM_ARMED, "trajectory canceled before start")
+                            return False
+                        self._send_ipm_segment(rec)
+                        time.sleep(inter)
+                    pidx = len(stream_records)
 
                 if self.cancel_requested.is_set():
                     self.get_logger().warning("Cancel requested before PVT manager start; halting")
@@ -924,9 +951,29 @@ class IngeniaJointBridge(Node):
                         f"pos={pos_rad:.4f} target={final_target_rad:.4f} "
                         f"buf={buf} rec={rec} sw=0x{sw:04X}"
                     )
+                    # Streaming top-up: feed more records when FIFO drops below low
+                    # watermark. Skipped when stream_enabled is False or all records
+                    # are already queued.
+                    if stream_enabled and pidx < len(stream_records) and buf is not None:
+                        fifo_low = int(self.get_parameter("pvt_fifo_low_watermark").value)
+                        fifo_capacity = int(self.get_parameter("pvt_fifo_capacity").value)
+                        max_per_cycle = int(self.get_parameter("pvt_stream_max_append_per_cycle").value)
+                        if buf <= fifo_low:
+                            room = max(0, fifo_capacity - buf - 1)
+                            n_append = min(max_per_cycle, room, len(stream_records) - pidx)
+                            for _ in range(n_append):
+                                self._send_ipm_segment(stream_records[pidx])
+                                pidx += 1
+                            if n_append > 0:
+                                self.get_logger().info(
+                                    f"FIFO topup: +{n_append} (buf was {buf}) "
+                                    f"sent={pidx}/{len(stream_records)}"
+                                )
+
                     in_tol = abs(final_target_rad - pos_rad) <= tolerance
                     buf_drained = (buf is not None and buf == 0)
-                    if in_tol and buf_drained and time.monotonic() >= earliest_complete:
+                    all_sent = pidx >= len(stream_records)
+                    if in_tol and buf_drained and all_sent and time.monotonic() >= earliest_complete:
                         self.get_logger().info(
                             f"Trajectory complete: pos={pos_rad:.4f} "
                             f"target={final_target_rad:.4f} "
@@ -1132,11 +1179,27 @@ class IngeniaJointBridge(Node):
         traj = goal_handle.request.trajectory
 
         if not self.ipm_armed:
-            if not self.startup_ipm():
+            armed = self.startup_ipm()
+            if not armed:
+                # Recoverable failure path: a latched fault from a previous
+                # session or session boundary will block startup_ipm. Try one
+                # cycle of clear_fault + re-arm before aborting the trajectory.
+                self.get_logger().warning(
+                    "Initial startup_ipm failed; attempting clear_fault + re-arm"
+                )
+                try:
+                    cf_ok = self.clear_fault()
+                except Exception as exc:
+                    self.get_logger().error(f"clear_fault raised: {exc}")
+                    cf_ok = False
+                time.sleep(0.5)
+                if cf_ok:
+                    armed = self.startup_ipm()
+            if not armed:
                 goal_handle.abort()
                 result = FollowJointTrajectory.Result()
                 result.error_code = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
-                result.error_string = "Failed to arm IPM"
+                result.error_string = "Failed to arm IPM (auto-recovery also failed)"
                 return result
 
         qs: List[float] = []
@@ -1160,7 +1223,7 @@ class IngeniaJointBridge(Node):
 
 
 
-        if bool(self.get_parameter("collapse_action_trajectory_to_final_point").value) and original_point_count > 1:
+        if (not bool(self.get_parameter("pvt_streaming_enabled").value)) and bool(self.get_parameter("collapse_action_trajectory_to_final_point").value) and original_point_count > 1:
 
 
 

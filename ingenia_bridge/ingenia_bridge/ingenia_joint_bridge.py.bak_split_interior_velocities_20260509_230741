@@ -1,0 +1,1417 @@
+#!/usr/bin/env python3
+"""Per-joint ROS 2 bridge node for Ingenia Everest CANopen drives.
+
+Mirrors the wire protocol of copley_bridge / epos2_j3_bridge so the
+existing orchestrator can drive a mixed-vendor arm without caring
+which vendor is behind a given joint:
+
+  Services:
+    /ingenia/jN/clear_fault          (std_srvs/Trigger)
+    /ingenia/jN/arm_ipm              (std_srvs/Trigger)
+    /ingenia/jN/disarm_ipm           (std_srvs/Trigger)
+    /ingenia/jN/move_absolute_timed  (epos2_bridge_interfaces/MoveAbsoluteTimed)
+
+  Subscriptions:
+    /ingenia/jN/reduced_traj         (Float64MultiArray, [q,v,dt,...])
+
+  Publications:
+    /joint_states                    (sensor_msgs/JointState)
+    /ingenia/jN/fault                (std_msgs/Bool)
+
+  Action server:
+    /jN_position_controller/follow_joint_trajectory
+
+PDO layout assumed (configure with apply_ingenia_pdo_remap_one.sh):
+  RPDO1  ->  0x2181 (pos i32) + 0x2183 (time u16)
+  RPDO2  ->  0x6040 ctrlword (16) + 0x6060 mode (8)
+  RPDO3  ->  0x2182 (vel f32) + 0x2184 (integrity-commit u16)
+  TPDO1  ->  0x2185 (record status u16) + 0x6041 statusword (16) + 0x6061 mode (8)
+  TPDO2  ->  0x6064 position actual (32) + 0x606C velocity actual (32, counts/sec)
+"""
+
+from __future__ import annotations
+
+import math
+import struct
+import threading
+import time
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import List, Optional
+
+import rclpy
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
+from rclpy.node import Node
+
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool, Float64MultiArray
+from control_msgs.action import FollowJointTrajectory
+
+from canopen_interfaces.srv import CORead, COWrite
+from std_srvs.srv import Trigger
+from epos2_bridge_interfaces.srv import MoveAbsoluteTimed
+
+from ingenia_bridge import cia402
+from ingenia_bridge.ingenia_ipm import (
+    IDX_IPM_POSITION_INPUT,
+    IDX_IPM_VELOCITY_INPUT,
+    IDX_IPM_TIME_INPUT,
+    IDX_IPM_INTEGRITY_CHECK,
+    IDX_IPM_RECORD_STATUS,
+    IDX_IPM_BUFFER_CLEAR,
+    IDX_IPM_BUFFER_NUM_ELEMENTS,
+    IDX_IPM_BUFFER_MAX_SIZE,
+    IDX_IPM_TIME_MANTISSA,
+    IDX_IPM_TIME_EXPONENT,
+    IDX_INGENIA_MFG_CONTROLWORD,
+    IDX_INGENIA_MFG_STATUSWORD,
+    IPMPoint,
+    IntegrityCounter,
+    IntegrityMode,
+    cob_emcy,
+    cob_heartbeat,
+    cob_rpdo1,
+    cob_rpdo2,
+    cob_rpdo3,
+    cob_tpdo1,
+    cob_tpdo2,
+    compute_integrity,
+    decode_record_status,
+    pack_pos_time_frame,
+    pack_vel_commit_frame,
+    to_signed_32,
+)
+from ingenia_bridge.raw_socket_can import RawSocketCAN
+
+
+class BridgeState(Enum):
+    IDLE = auto()
+    FAULTED = auto()
+    READY = auto()
+    IPM_ARMED = auto()
+    MOVING = auto()
+
+
+@dataclass
+class JointKinematics:
+    """Conversion between motor encoder counts and ROS joint-space units.
+
+    For revolute joints, ROS/MoveIt position units are radians.
+    For prismatic joints, ROS/MoveIt position units are meters.
+
+    Ingenia 0x6064 is in encoder counts. For the EVS-XCR-C with a
+    17-bit absolute single-turn encoder, encoder_qc_per_motor_rev is
+    131072. Velocity feedback (0x606C) is integer counts/sec; segment
+    velocity input (0x2182) is FLOAT32 in revolutions per second.
+    """
+    joint_name: str = "joint0"
+    encoder_qc_per_motor_rev: float = 0.0
+    gear_ratio_motor_per_joint_rev: float = 0.0
+    sign: float = 1.0
+    zero_offset_qc: float = 0.0
+    interface_type: str = "revolute"          # "revolute" => rad, "prismatic" => m
+    linear_m_per_joint_rad: float = 1.0       # prismatic scale; pulley radius in m for belt stages
+
+    def is_configured(self) -> bool:
+        base_ok = (
+            self.encoder_qc_per_motor_rev > 0.0
+            and self.gear_ratio_motor_per_joint_rev > 0.0
+            and self.interface_type in ("revolute", "prismatic")
+        )
+        if not base_ok:
+            return False
+        if self.interface_type == "prismatic":
+            return self.linear_m_per_joint_rad > 0.0
+        return True
+
+    def motor_qc_to_joint_rad(self, motor_qc: int) -> float:
+        return (
+            self.sign
+            * (float(motor_qc) - self.zero_offset_qc)
+            * 2.0 * math.pi
+            / (self.encoder_qc_per_motor_rev * self.gear_ratio_motor_per_joint_rev)
+        )
+
+    def joint_rad_to_motor_qc(self, joint_rad: float) -> int:
+        motor_qc = (
+            self.zero_offset_qc
+            + self.sign * joint_rad
+            * (self.encoder_qc_per_motor_rev * self.gear_ratio_motor_per_joint_rev)
+            / (2.0 * math.pi)
+        )
+        return int(round(motor_qc))
+
+    def motor_ct_s_to_joint_rad_s(self, motor_ct_s: int) -> float:
+        motor_rev_s = float(motor_ct_s) / self.encoder_qc_per_motor_rev
+        joint_rev_s = motor_rev_s / self.gear_ratio_motor_per_joint_rev
+        return self.sign * joint_rev_s * 2.0 * math.pi
+
+    def joint_rad_s_to_motor_rev_s(self, joint_rad_s: float) -> float:
+        return self.sign * joint_rad_s / (2.0 * math.pi) * self.gear_ratio_motor_per_joint_rev
+
+    def unit_label(self) -> str:
+        return "m" if self.interface_type == "prismatic" else "rad"
+
+    def motor_qc_to_joint_unit(self, motor_qc: int) -> float:
+        joint_rad = self.motor_qc_to_joint_rad(motor_qc)
+        if self.interface_type == "prismatic":
+            return joint_rad * self.linear_m_per_joint_rad
+        return joint_rad
+
+    def joint_unit_to_motor_qc(self, joint_position: float) -> int:
+        if self.interface_type == "prismatic":
+            joint_rad = joint_position / self.linear_m_per_joint_rad
+        else:
+            joint_rad = joint_position
+        return self.joint_rad_to_motor_qc(joint_rad)
+
+    def motor_ct_s_to_joint_unit_s(self, motor_ct_s: int) -> float:
+        joint_rad_s = self.motor_ct_s_to_joint_rad_s(motor_ct_s)
+        if self.interface_type == "prismatic":
+            return joint_rad_s * self.linear_m_per_joint_rad
+        return joint_rad_s
+
+    def joint_unit_s_to_motor_rev_s(self, joint_velocity: float) -> float:
+        if self.interface_type == "prismatic":
+            joint_rad_s = joint_velocity / self.linear_m_per_joint_rad
+        else:
+            joint_rad_s = joint_velocity
+        return self.joint_rad_s_to_motor_rev_s(joint_rad_s)
+
+
+@dataclass
+class DriveState:
+    statusword: int = 0
+    mode_display: int = 0
+    record_status: int = 0          # raw 0x2185 from TPDO1
+    position_actual_qc: int = 0
+    velocity_actual_ct_s: int = 0
+    heartbeat_state: int = 0
+    bus_operational: bool = False
+    last_emcy_code: int = 0
+    last_emcy_reg: int = 0
+    last_update_ns: int = 0
+
+
+class IngeniaJointBridge(Node):
+
+    def __init__(self) -> None:
+        super().__init__("ingenia_joint_bridge")
+
+        self._declare_parameters()
+        self._read_kinematics()
+        if not self.kin.is_configured():
+            self.get_logger().fatal(
+                f"Encoder counts and gear ratio must be set for joint '{self.kin.joint_name}'. "
+                "Override 'encoder_qc_per_motor_rev', 'gear_ratio_motor_per_joint_rev', and prismatic scale parameters "
+                "in the launch file or YAML config. Refusing to start."
+            )
+            raise RuntimeError("ingenia_bridge: kinematics not configured")
+
+        self.drive_node_id = int(self.get_parameter("drive_node_id").value)
+        self.can_interface = str(self.get_parameter("can_interface").value)
+
+        self.cob_heartbeat = cob_heartbeat(self.drive_node_id)
+        self.cob_rpdo1 = cob_rpdo1(self.drive_node_id)
+        self.cob_rpdo2 = cob_rpdo2(self.drive_node_id)
+        self.cob_rpdo3 = cob_rpdo3(self.drive_node_id)
+        self.cob_tpdo1 = cob_tpdo1(self.drive_node_id)
+        self.cob_tpdo2 = cob_tpdo2(self.drive_node_id)
+        self.cob_emcy = cob_emcy(self.drive_node_id)
+
+        self.state = DriveState()
+        self.state_lock = threading.Lock()
+        self.stream_lock = threading.Lock()
+        self.cancel_requested = threading.Event()
+
+        self.bridge_state = BridgeState.IDLE
+        self.ipm_armed = False
+        self.last_hold_qc = 0
+        self.integrity = IntegrityCounter()
+        self.integrity_mode = IntegrityMode(
+            str(self.get_parameter("integrity_check_mode").value)
+        )
+        self.startup_complete = False
+
+        # SDO calls run on a dedicated single-threaded executor in their
+        # own thread, so they don't deadlock the main MultiThreadedExecutor.
+        sdo_ns = f"/node_{self.drive_node_id}"
+        self._sdo_node = rclpy.create_node(f"{self.get_name()}_sdo_worker", use_global_arguments=False)
+        self.read_cli = self._sdo_node.create_client(CORead, f"{sdo_ns}/sdo_read")
+        self.write_cli = self._sdo_node.create_client(COWrite, f"{sdo_ns}/sdo_write")
+        self._sdo_executor = SingleThreadedExecutor()
+        self._sdo_executor.add_node(self._sdo_node)
+        self._sdo_thread = threading.Thread(target=self._sdo_executor.spin, daemon=True)
+        self._sdo_thread.start()
+
+        self.can = RawSocketCAN(self.can_interface)
+
+        self._setup_pubs_subs()
+        self._setup_services()
+        self._setup_action_server()
+
+        self.rx_thread_running = True
+        self.rx_thread = threading.Thread(target=self._can_rx_loop, daemon=True)
+        self.rx_thread.start()
+
+        self.create_timer(
+            1.0 / float(self.get_parameter("joint_state_rate_hz").value),
+            self._publish_joint_state,
+        )
+        self.create_timer(0.05, self._ipm_keepalive_cb)
+        self.startup_timer = self.create_timer(0.5, self._startup_once)
+
+        self.get_logger().info(
+            f"ingenia_bridge for {self.kin.joint_name} on {self.can_interface} "
+            f"node_id={self.drive_node_id} integrity_mode={self.integrity_mode.value}"
+        )
+        self.get_logger().info(
+            f"joint_interface={self.kin.interface_type} unit={self.kin.unit_label()} "
+            f"linear_m_per_joint_rad={self.kin.linear_m_per_joint_rad:.6g}"
+        )
+
+    def _declare_parameters(self) -> None:
+        self.declare_parameter("can_interface", "can0")
+        self.declare_parameter("drive_node_id", 10)
+        self.declare_parameter("joint_name", "joint0")
+        self.declare_parameter("encoder_qc_per_motor_rev", 0.0)        # MUST override
+        self.declare_parameter("gear_ratio_motor_per_joint_rev", 0.0)  # MUST override
+        # ROS/MoveIt joint interface units. Use "prismatic" when the URDF joint is linear.
+        self.declare_parameter("joint_interface_type", "revolute")
+        # For a belt/pulley stage, this is pulley radius in meters. 50 mm diameter => 0.025.
+        self.declare_parameter("linear_m_per_joint_rad", 1.0)
+        self.declare_parameter("sign", 1.0)
+        self.declare_parameter("zero_offset_qc", 0.0)
+        self.declare_parameter("joint_state_rate_hz", 50.0)
+        self.declare_parameter("ipm_default_segment_ms", 100)
+        self.declare_parameter("ipm_min_segment_ms", 20)
+        self.declare_parameter("goal_position_tolerance_rad", 0.03)
+        self.declare_parameter("fault_clear_on_startup", True)
+        self.declare_parameter("enable_on_startup", False)
+        self.declare_parameter("force_ipm_on_startup", False)
+        # 0x60C2 is currently mantissa=1, exponent=-3 (1 ms units). Bridge
+        # uses time_units = round(seconds * 1000.0). Override if you change
+        # the drive's time period.
+        self.declare_parameter("time_units_per_second", 1000.0)
+        # Integrity-check strategy for 0x2184 -- "counter" | "constant" | "echo_pos".
+        # The exact protocol the drive expects isn't in the public docs we have;
+        # adjust empirically by watching 0x2185 status on the bench.
+        self.declare_parameter("integrity_check_mode", "counter")
+        # Inter-segment send pacing (no buffer free count on TPDO yet).
+        self.declare_parameter("inter_segment_sleep_s", 0.005)
+        # Temporary bringup mode for RViz/MoveIt dense FollowJointTrajectory goals.
+        # The EVS buffered-PVT FIFO is small; until rolling buffer flow-control is implemented,
+        # collapse action trajectories to the final setpoint over the planned total duration.
+        self.declare_parameter("collapse_action_trajectory_to_final_point", True)
+        self.declare_parameter("action_trajectory_point_warning_threshold", 12)
+        # Long collapsed RViz/MoveIt moves are split so each PVT time field remains legal.
+        # 0x2183 is currently PDO-mapped as 16 bits, so keep each segment well below 65535 ms.
+        self.declare_parameter("collapsed_action_max_segment_s", 50.0)
+        # execute_pvt_trajectory queues: 1 lead + N motion segments + 8 holds. EVS buffer is 16.
+        # Therefore N <= 7 avoids overfilling until rolling FIFO flow-control exists.
+        self.declare_parameter("collapsed_action_max_segments", 7)
+        self.declare_parameter("pvt_segment_max_time_units", 60000)
+        self.declare_parameter("completion_min_duration_fraction", 0.95)
+        # Hardware execution can lag the nominal MoveIt/TOTG duration because this
+        # bridge must arm PVT, queue segments, and wait for actual position/buffer drain.
+        # Budget = max(requested_duration * scaling + margin, min_timeout).
+        self.declare_parameter("trajectory_timeout_scaling", 3.0)
+        self.declare_parameter("trajectory_timeout_margin_s", 5.0)
+        self.declare_parameter("trajectory_min_timeout_s", 8.0)
+        # Final architecture: arm_trajectory_fanout owns /arm_controller.
+        # Leave false unless doing direct single-joint bench tests without fanout.
+        self.declare_parameter("expose_arm_controller_alias", False)
+
+    def _read_kinematics(self) -> None:
+        self.kin = JointKinematics(
+            joint_name=str(self.get_parameter("joint_name").value),
+            encoder_qc_per_motor_rev=float(self.get_parameter("encoder_qc_per_motor_rev").value),
+            gear_ratio_motor_per_joint_rev=float(self.get_parameter("gear_ratio_motor_per_joint_rev").value),
+            sign=float(self.get_parameter("sign").value),
+            zero_offset_qc=float(self.get_parameter("zero_offset_qc").value),
+            interface_type=str(self.get_parameter("joint_interface_type").value),
+            linear_m_per_joint_rad=float(self.get_parameter("linear_m_per_joint_rad").value),
+        )
+
+    def _setup_pubs_subs(self) -> None:
+        self.pub_joint_states = self.create_publisher(JointState, "/joint_states", 10)
+        self.pub_fault = self.create_publisher(Bool, "fault", 1)
+        self.create_subscription(
+            Float64MultiArray, "reduced_traj", self._reduced_traj_cb, 10
+        )
+
+    def _setup_services(self) -> None:
+        cb = MutuallyExclusiveCallbackGroup()
+        self.create_service(Trigger, "clear_fault", self._srv_clear_fault, callback_group=cb)
+        self.create_service(Trigger, "arm_ipm", self._srv_arm_ipm, callback_group=cb)
+        self.create_service(Trigger, "disarm_ipm", self._srv_disarm_ipm, callback_group=cb)
+        self.create_service(
+            MoveAbsoluteTimed, "move_absolute_timed",
+            self._srv_move_absolute_timed, callback_group=cb,
+        )
+
+    def _setup_action_server(self) -> None:
+        """Expose this bridge's single-joint FollowJointTrajectory endpoint.
+
+        Normal full-arm architecture:
+          /arm_controller/follow_joint_trajectory
+              owned by arm_trajectory_fanout
+
+        Per-joint bridge endpoint:
+          /<joint_name>_position_controller/follow_joint_trajectory
+              owned by this bridge
+        """
+        action_names = [
+            f"/{self.kin.joint_name}_position_controller/follow_joint_trajectory",
+        ]
+
+        if bool(self.get_parameter("expose_arm_controller_alias").value):
+            action_names.append("/arm_controller/follow_joint_trajectory")
+
+        self.action_server = None
+        self.action_servers = []
+        for action_name in dict.fromkeys(action_names):
+            server = ActionServer(
+                self,
+                FollowJointTrajectory,
+                action_name,
+                execute_callback=self._action_execute,
+                goal_callback=self._action_goal,
+                cancel_callback=self._action_cancel,
+                callback_group=ReentrantCallbackGroup(),
+            )
+            if self.action_server is None:
+                self.action_server = server
+            self.action_servers.append(server)
+            self.get_logger().info(f"FollowJointTrajectory server ready: {action_name}")
+
+    # ------------------------------ SDO helpers ------------------------------
+
+    def sdo_read(self, index: int, subindex: int, *, warn: bool = True, timeout: float = 0.5) -> Optional[int]:
+        if not self.read_cli.service_is_ready():
+            if warn:
+                self.get_logger().warning(f"SDO read not ready for 0x{index:04X}:{subindex}")
+            return None
+        req = CORead.Request()
+        req.index = index
+        req.subindex = subindex
+        future = self.read_cli.call_async(req)
+        ev = threading.Event()
+        future.add_done_callback(lambda f: ev.set())
+        if not ev.wait(timeout):
+            if warn:
+                self.get_logger().warning(f"SDO read 0x{index:04X}:{subindex} timed out")
+            return None
+        resp = future.result()
+        if resp is None or not getattr(resp, "success", True):
+            if warn:
+                self.get_logger().warning(f"SDO read 0x{index:04X}:{subindex} returned !success")
+            return None
+        return int(resp.data)
+
+    def sdo_write(self, index: int, subindex: int, value: int, *, warn: bool = True, timeout: float = 0.5) -> bool:
+        if not self.write_cli.service_is_ready():
+            if warn:
+                self.get_logger().warning(f"SDO write not ready for 0x{index:04X}:{subindex}")
+            return False
+        req = COWrite.Request()
+        req.index = index
+        req.subindex = subindex
+        req.data = int(value)
+        future = self.write_cli.call_async(req)
+        ev = threading.Event()
+        future.add_done_callback(lambda f: ev.set())
+        if not ev.wait(timeout):
+            if warn:
+                self.get_logger().warning(f"SDO write 0x{index:04X}:{subindex} timed out")
+            return False
+        resp = future.result()
+        return bool(getattr(resp, "success", True))
+
+    # ------------------------------ State machine ------------------------------
+
+    def _set_bridge_state(self, new_state: BridgeState, reason: str = "") -> None:
+        if self.bridge_state != new_state:
+            self.get_logger().info(
+                f"Bridge state {self.bridge_state.name} -> {new_state.name}"
+                + (f" ({reason})" if reason else "")
+            )
+        self.bridge_state = new_state
+
+    def _read_native_statusword(self, *, warn: bool = False) -> Optional[int]:
+        sw = self.sdo_read(IDX_INGENIA_MFG_STATUSWORD, 0, warn=warn)
+        if sw is None:
+            sw = self.sdo_read(cia402.IDX_STATUSWORD, 0, warn=warn)
+        return None if sw is None else int(sw) & 0xFFFF
+
+    def _write_native_controlword(self, value: int, *, warn: bool = True, timeout: float = 0.8) -> bool:
+        return self.sdo_write(IDX_INGENIA_MFG_CONTROLWORD, 0, int(value) & 0xFFFF, warn=warn, timeout=timeout)
+
+    def _log_drive_snapshot(self, label: str) -> None:
+        cw2010 = self.sdo_read(IDX_INGENIA_MFG_CONTROLWORD, 0, warn=False)
+        sw2011 = self.sdo_read(IDX_INGENIA_MFG_STATUSWORD, 0, warn=False)
+        cw6040 = self.sdo_read(cia402.IDX_CONTROLWORD, 0, warn=False)
+        sw6041 = self.sdo_read(cia402.IDX_STATUSWORD, 0, warn=False)
+        err = self.sdo_read(0x603F, 0, warn=False)
+        mode = self.sdo_read(0x2015, 0, warn=False)
+        buf = self.sdo_read(IDX_IPM_BUFFER_NUM_ELEMENTS, 0, warn=False)
+        rec = self.sdo_read(IDX_IPM_RECORD_STATUS, 0, warn=False)
+        self.get_logger().info(f"{label}: cw2010={cw2010} sw2011={sw2011} cw6040={cw6040} sw6041={sw6041} err603F={err} mode2015={mode} buf21F8={buf} rec2185={rec}")
+
+    def _start_pvt_manager(self) -> bool:
+        # Bench-proven EVS-XCR-C sequence: hold Run-SPM, pulse New Setpoint bit 9, hold Run-SPM.
+        for cw in (0x001F, 0x021F, 0x001F):
+            if not self._write_native_controlword(cw, warn=False):
+                self.get_logger().error(f"Failed writing native 0x2010 = 0x{cw:04X}")
+                return False
+            time.sleep(0.01)
+        return True
+
+    def clear_fault(self) -> bool:
+        ok = self._write_native_controlword(cia402.CW_FAULT_RESET, warn=False)
+        time.sleep(0.05)
+        self._write_native_controlword(0x0000, warn=False)
+        time.sleep(0.05)
+        self._write_native_controlword(cia402.CW_SHUTDOWN, warn=False)
+        time.sleep(0.05)
+        sw = self._read_native_statusword(warn=False)
+        if sw is not None:
+            self.get_logger().info(f"clear_fault native statusword=0x{sw & 0xFFFF:04X}")
+            return ok and not cia402.sw_faulted(sw)
+        return ok
+
+    def set_mode(self, mode: int) -> bool:
+        return self.sdo_write(cia402.IDX_MODES_OF_OPERATION, 0, mode)
+
+    def enable_operation(self) -> bool:
+        sw0 = self._read_native_statusword(warn=False)
+        if sw0 is not None and cia402.sw_operation_enabled(sw0) and not cia402.sw_faulted(sw0):
+            self.get_logger().info(f"enable_operation: already operation-enabled, sw=0x{sw0:04X}")
+            return True
+        if sw0 is not None and cia402.sw_faulted(sw0):
+            self.get_logger().warning(f"enable_operation: fault bit set before enable, sw=0x{sw0:04X}; clearing")
+            self.clear_fault(); time.sleep(0.1)
+        ok = True
+        for cw in (cia402.CW_SHUTDOWN, cia402.CW_SWITCH_ON, cia402.CW_ENABLE_OPERATION):
+            ok = self._write_native_controlword(cw, warn=False) and ok
+            time.sleep(0.08)
+        deadline = time.monotonic() + 2.0
+        last_sw = None
+        while time.monotonic() < deadline:
+            sw = self._read_native_statusword(warn=False)
+            if sw is not None:
+                last_sw = sw & 0xFFFF
+                if cia402.sw_faulted(last_sw):
+                    self.get_logger().error(f"Drive faulted during enable_operation, sw=0x{last_sw:04X}")
+                    self._log_drive_snapshot("enable_operation fault snapshot")
+                    return False
+                if cia402.sw_operation_enabled(last_sw):
+                    self.get_logger().info(f"enable_operation native statusword=0x{last_sw:04X}")
+                    return True
+            time.sleep(0.03)
+        self.get_logger().error(f"enable_operation did not reach Operation Enabled, last sw={last_sw}")
+        if not ok:
+            self.get_logger().error("One or more native 0x2010 writes failed during enable_operation")
+        self._log_drive_snapshot("enable_operation failed snapshot")
+        return False
+
+    def _verify_pdo_mapping(self) -> bool:
+        """Refuse to arm if the operator hasn't run the PDO remap script.
+
+        We check the four mappings that carry our IPM segment + statusword.
+        Velocity feedback PDO is checked last as a sanity probe.
+        """
+        expected = {
+            (0x1600, 1, "RPDO1[1] (0x2181 pos)"): 0x21810020,
+            (0x1600, 2, "RPDO1[2] (0x2183 time)"): 0x21830010,
+            (0x1602, 1, "RPDO3[1] (0x2182 vel)"): 0x21820020,
+            (0x1602, 2, "RPDO3[2] (0x2184 integ)"): 0x21840010,
+            (0x1A00, 1, "TPDO1[1] (0x2185 rec_status)"): 0x21850010,
+            (0x1A00, 2, "TPDO1[2] (0x6041 statusword)"): 0x60410010,
+            (0x1A00, 3, "TPDO1[3] (0x6061 mode disp)"): 0x60610008,
+            (0x1A01, 1, "TPDO2[1] (0x6064 pos actual)"): 0x60640020,
+            (0x1A01, 2, "TPDO2[2] (0x606C vel actual)"): 0x606C0020,
+        }
+        all_ok = True
+        for (idx, sub, label), want in expected.items():
+            got = self.sdo_read(idx, sub, warn=False)
+            if got is None:
+                self.get_logger().warning(f"PDO mapping {label} could not be read")
+                all_ok = False
+                continue
+            got &= 0xFFFFFFFF
+            if got != want:
+                self.get_logger().error(
+                    f"PDO mapping {label} = 0x{got:08X}, expected 0x{want:08X}. "
+                    "Run scripts/apply_ingenia_pdo_remap_one.sh before bringup."
+                )
+                all_ok = False
+        return all_ok
+
+    def startup_ipm(self) -> bool:
+        self.get_logger().info("Arming IPM (Ingenia split-record path)")
+        if self.ipm_armed and self.bridge_state == BridgeState.IPM_ARMED:
+            sw = self._read_native_statusword(warn=False)
+            mode_disp = self.sdo_read(0x2015, 0, warn=False)
+            if sw is not None and cia402.sw_operation_enabled(sw) and not cia402.sw_faulted(sw) and mode_disp == 0xB4:
+                self.get_logger().info("startup_ipm: already armed and healthy")
+                return True
+        self.ipm_armed = False
+        self._set_bridge_state(BridgeState.IDLE, "starting arm sequence")
+
+        try:
+            if not self._verify_pdo_mapping():
+                self._set_bridge_state(BridgeState.FAULTED, "PDO mapping verification failed")
+                return False
+
+            sw0 = self.sdo_read(cia402.IDX_STATUSWORD, 0, warn=False)
+            if sw0 is not None and cia402.sw_faulted(sw0):
+                if not self.clear_fault():
+                    self._set_bridge_state(BridgeState.FAULTED, "clear_fault failed")
+                    return False
+                time.sleep(0.05)
+
+            # The Ingenia EVS-XCR-C uses a manufacturer-specific mode register (0x2014)
+            # that does NOT accept CiA 402 mode 7. Buffered PVT is encoded as 0xB4 (180).
+            # Verify via 0x2015 (manufacturer mode display).
+            if not self.sdo_write(0x2014, 0, 0xB4):
+                self._set_bridge_state(BridgeState.FAULTED, "failed to write 0x2014 = 0xB4 (Buffered PVT)")
+                return False
+            mode_disp = self.sdo_read(0x2015, 0, warn=False)
+            if mode_disp != 0xB4:
+                self.get_logger().error(f"PVT mode set failed: 0x2015 = {mode_disp} (expected 180/0xB4)")
+                self._set_bridge_state(BridgeState.FAULTED, "PVT mode not accepted")
+                return False
+            self.get_logger().info(f"Drive in Buffered PVT mode (0x2015 = 0xB4)")
+
+            # Profiler latching mode (0x21C8). Default is 64. Write explicitly so
+            # we don't depend on the drive's default surviving fault clears.
+            if not self.sdo_write(0x21C8, 0, 64, warn=False):
+                self.get_logger().warning("Could not write 0x21C8 = 64; continuing")
+            latch_mode = self.sdo_read(0x21C8, 0, warn=False)
+            if latch_mode != 64:
+                self.get_logger().warning(
+                    f"0x21C8 latching mode = {latch_mode} (expected 64)"
+                )
+
+            # Read current position FIRST (before enabling) so we can pre-load the buffer.
+            current_pos = self.sdo_read(cia402.IDX_POSITION_ACTUAL, 0, warn=False)
+            if current_pos is None:
+                self._set_bridge_state(BridgeState.FAULTED, "no current position")
+                return False
+            current_qc = to_signed_32(current_pos)
+            self.last_hold_qc = current_qc
+
+            # Sync our integrity counter to the drive's current 0x2184 value.
+            # The drive's append-trigger expects each new segment's integrity to be
+            # exactly previous + 1. Our local counter has to match the drive's state.
+            current_integ = self.sdo_read(IDX_IPM_INTEGRITY_CHECK, 0, warn=False)
+            if current_integ is not None:
+                start_val = ((current_integ & 0xFFFF) + 1) & 0xFFFF
+                if start_val == 0:
+                    start_val = 1
+                self.integrity.reset(start=start_val)
+                self.get_logger().info(
+                    f"Synced integrity counter: drive's 0x2184 = {current_integ}, "
+                    f"starting our counter at {start_val}"
+                )
+            else:
+                self.get_logger().warning("Could not read 0x2184; defaulting integrity counter to 1")
+                self.integrity.reset()
+
+            # Clear the IPM buffer (0x21F6 -- any write clears).
+            if self.sdo_write(IDX_IPM_BUFFER_CLEAR, 0, 0, warn=False):
+                self.get_logger().info("Cleared IPM buffer (0x21F6)")
+            else:
+                self.get_logger().warning("Could not clear IPM buffer; continuing anyway")
+
+            seg_ms = max(
+                int(self.get_parameter("ipm_min_segment_ms").value),
+                int(self.get_parameter("ipm_default_segment_ms").value),
+            )
+            time_units = self._seconds_to_time_units(seg_ms / 1000.0)
+            hold = IPMPoint(position_qc=current_qc, velocity_rev_s=0.0, time_units=time_units)
+            for _ in range(6):
+                self._send_ipm_segment(hold)
+                time.sleep(0.002)
+
+            # Buffer is now pre-loaded with hold segments. Enable operation.
+            if not self.enable_operation():
+                self._set_bridge_state(BridgeState.FAULTED, "enable_operation failed")
+                return False
+
+            if not self._start_pvt_manager():
+                self._log_drive_snapshot("startup_ipm PVT manager start failed")
+                self._set_bridge_state(BridgeState.FAULTED, "failed to start PVT manager")
+                return False
+            time.sleep(0.05)
+
+            for _ in range(6):
+                self._send_ipm_segment(hold)
+                time.sleep(0.002)
+
+            time.sleep(0.05)
+
+            sw = self._read_native_statusword(warn=False)
+            rec = self.sdo_read(IDX_IPM_RECORD_STATUS, 0, warn=False)
+            buf_n = self.sdo_read(IDX_IPM_BUFFER_NUM_ELEMENTS, 0, warn=False)
+            buf_max = self.sdo_read(IDX_IPM_BUFFER_MAX_SIZE, 0, warn=False)
+
+            sw_hex = f"0x{sw:04X}" if sw is not None else "None"
+            rec_hex = f"0x{rec:08X}" if rec is not None else "None"
+            self.get_logger().info(
+                f"startup_ipm sw={sw_hex} rec_status={rec_hex} "
+                f"buf_elems={buf_n} buf_max={buf_max}"
+            )
+
+            if sw is not None and cia402.sw_faulted(sw):
+                self._set_bridge_state(BridgeState.FAULTED, "fault during arm")
+                return False
+
+            if rec is not None and rec != 0:
+                self.get_logger().warning(
+                    f"0x2185 record_status = 0x{rec:08X} after arm. "
+                    "If segments aren't being accepted, try a different "
+                    "integrity_check_mode (counter/constant/echo_pos)."
+                )
+
+            self.ipm_armed = True
+            self._set_bridge_state(BridgeState.IPM_ARMED, "IPM active")
+            self.get_logger().info("IPM armed")
+            return True
+
+        except Exception as exc:
+            self.get_logger().error(f"startup_ipm exception: {exc}")
+            self._set_bridge_state(BridgeState.FAULTED, "startup_ipm exception")
+            self.ipm_armed = False
+            return False
+
+    def _halt_pvt(self) -> None:
+        """Stop PVT extraction while keeping the servo Operation Enabled/holding."""
+        self._write_native_controlword(0x000F, warn=False)
+        self.sdo_write(IDX_IPM_BUFFER_CLEAR, 0, 0, warn=False)
+
+    def disarm_ipm(self) -> bool:
+        self.ipm_armed = False
+        time.sleep(0.05)
+        self._halt_pvt()
+        time.sleep(0.05)
+        self._set_bridge_state(BridgeState.READY, "disarm")
+        return True
+
+    # ------------------------------ Streaming ------------------------------
+
+    def _seconds_to_time_units(self, seconds: float) -> int:
+        units_per_s = float(self.get_parameter("time_units_per_second").value)
+        return max(1, int(round(seconds * units_per_s)))
+
+    def _send_ipm_segment(self, point: IPMPoint) -> None:
+        """Two-frame send: stage pos+time on RPDO1, then commit via RPDO3.
+
+        Order matters: RPDO1 first writes 0x2181 + 0x2183 into the drive's
+        staging area, RPDO3 then writes 0x2182 (velocity) AND 0x2184
+        (integrity check). The integrity-check write is the trigger that
+        commits the staged segment to the buffer.
+        """
+        integrity = compute_integrity(self.integrity_mode, self.integrity, point)
+        # Debug: log every segment we send so we can correlate against drive behaviour.
+        t_ms = int(time.monotonic() * 1000) % 100000
+        self.get_logger().info(
+            f"SEG t={t_ms} pos_qc={point.position_qc} vel={point.velocity_rev_s:.4f} "
+            f"time_u={point.time_units} integ={integrity}"
+        )
+        self.can.send(self.cob_rpdo1, pack_pos_time_frame(point))
+        # No sleep between the two frames -- the CAN bus serializes them
+        # and the drive shouldn't see the commit before the staging write.
+        self.can.send(self.cob_rpdo3, pack_vel_commit_frame(point, integrity))
+
+    def _ipm_keepalive_cb(self) -> None:
+        if not self.ipm_armed:
+            return
+        if self.bridge_state != BridgeState.IPM_ARMED:
+            return
+
+        seg_ms = max(
+            int(self.get_parameter("ipm_min_segment_ms").value),
+            int(self.get_parameter("ipm_default_segment_ms").value),
+        )
+        time_units = self._seconds_to_time_units(seg_ms / 1000.0)
+        hold = IPMPoint(
+            position_qc=self.last_hold_qc, velocity_rev_s=0.0, time_units=time_units
+        )
+        try:
+            self._send_ipm_segment(hold)
+        except Exception as exc:
+            self.get_logger().error(f"IPM keepalive send failed: {exc}")
+
+    def execute_pvt_trajectory(
+        self,
+        target_rads: List[float],
+        target_vel_rad_s: List[float],
+        duration_secs: List[float],
+    ) -> bool:
+        if not self.ipm_armed:
+            self.get_logger().warning("IPM not armed; call arm_ipm first")
+            return False
+        n_in = len(target_rads)
+        if n_in == 0 or len(target_vel_rad_s) != n_in or len(duration_secs) != n_in:
+            self.get_logger().error("execute_pvt_trajectory got mismatched or empty arrays")
+            return False
+
+        with self.stream_lock:
+            if self.bridge_state not in (BridgeState.IPM_ARMED, BridgeState.MOVING):
+                self.get_logger().warning(
+                    f"Refusing trajectory in state {self.bridge_state.name}"
+                )
+                return False
+
+            current_pos = self.sdo_read(cia402.IDX_POSITION_ACTUAL, 0, warn=False)
+            if current_pos is None:
+                self.get_logger().error("Failed reading current position for trajectory")
+                return False
+            current_qc = to_signed_32(current_pos)
+            current_rad = self.kin.motor_qc_to_joint_unit(current_qc)
+            # Debug: log the exact starting state so we can check kinematics by hand.
+            self.get_logger().info(
+                f"TRAJ_START current_qc={current_qc} current_rad={current_rad:.4f} "
+                f"target_units={target_rads} target_vel_units={target_vel_rad_s} "
+                f"durations={duration_secs}"
+            )
+
+            min_seg_s = max(0.001, int(self.get_parameter("ipm_min_segment_ms").value) / 1000.0)
+
+            points: List[IPMPoint] = []
+            prev_q = current_rad
+            prev_v = 0.0
+            for q, v, dt in zip(target_rads, target_vel_rad_s, duration_secs):
+                q = float(q)
+                v = float(v)
+                dt = max(min_seg_s, float(dt))
+                # No 255ms cap like Copley -- 0x2183 is u32, plenty of headroom.
+                pos_qc = self.kin.joint_unit_to_motor_qc(q)
+                vel_rev_s = self.kin.joint_unit_s_to_motor_rev_s(v)
+                time_units = self._seconds_to_time_units(dt)
+                max_time_units = int(self.get_parameter("pvt_segment_max_time_units").value)
+                if time_units > max_time_units:
+                    self.get_logger().error(
+                        f"PVT segment dt={dt:.3f}s -> time_units={time_units} exceeds "
+                        f"pvt_segment_max_time_units={max_time_units}. Split the move or reduce duration."
+                    )
+                    return False
+                points.append(IPMPoint(
+                    position_qc=int(pos_qc),
+                    velocity_rev_s=float(vel_rev_s),
+                    time_units=time_units,
+                ))
+                prev_q = q
+                prev_v = v
+
+            if not points:
+                self.get_logger().warning("Trajectory produced no executable points")
+                return False
+
+            self.get_logger().info(
+                f"Trajectory packetization: {n_in} knots -> {len(points)} segments"
+            )
+            self._set_bridge_state(BridgeState.MOVING, "executing trajectory")
+
+            inter = float(self.get_parameter("inter_segment_sleep_s").value)
+            try:
+                # Halt the drive's interpolator and clear any leftover segments
+                # from a previous trajectory before queueing new ones. Without
+                # this, the drive consumes stale hold-at-previous-target segments
+                # before reaching the new trajectory and ends up moving the
+                # wrong direction.
+                self._write_native_controlword(0x000F, warn=False)
+                self.sdo_write(IDX_IPM_BUFFER_CLEAR, 0, 0, warn=False)
+                time.sleep(0.05)
+
+                # Lead-in segment so the drive has slack while we stream.
+                lead = IPMPoint(
+                    position_qc=current_qc, velocity_rev_s=0.0,
+                    time_units=self._seconds_to_time_units(0.04),
+                )
+                self._send_ipm_segment(lead)
+                time.sleep(inter)
+
+                for pt in points:
+                    self._send_ipm_segment(pt)
+                    time.sleep(inter)
+
+                final_qc = points[-1].position_qc
+                self.last_hold_qc = final_qc
+
+                hold = IPMPoint(
+                    position_qc=final_qc, velocity_rev_s=0.0,
+                    time_units=self._seconds_to_time_units(0.04),
+                )
+                for _ in range(8):
+                    if self.cancel_requested.is_set():
+                        self.get_logger().warning("Cancel requested before PVT manager start; halting")
+                        self._halt_pvt()
+                        self._set_bridge_state(BridgeState.IPM_ARMED, "trajectory canceled before start")
+                        return False
+                    self._send_ipm_segment(hold)
+                    time.sleep(inter)
+
+                if self.cancel_requested.is_set():
+                    self.get_logger().warning("Cancel requested before PVT manager start; halting")
+                    self._halt_pvt()
+                    self._set_bridge_state(BridgeState.IPM_ARMED, "trajectory canceled before start")
+                    return False
+
+                if not self._start_pvt_manager():
+                    self._log_drive_snapshot("trajectory PVT manager start failed")
+                    self._halt_pvt()
+                    self._set_bridge_state(BridgeState.IPM_ARMED, "PVT manager start failed")
+                    return False
+
+                tolerance = float(self.get_parameter("goal_position_tolerance_rad").value)
+                requested_duration_s = sum(max(min_seg_s, float(d)) for d in duration_secs)
+                timeout_scaling = max(1.0, float(self.get_parameter("trajectory_timeout_scaling").value))
+                timeout_margin_s = max(0.0, float(self.get_parameter("trajectory_timeout_margin_s").value))
+                min_timeout_s = max(1.5, float(self.get_parameter("trajectory_min_timeout_s").value))
+                total_wait = max(requested_duration_s * timeout_scaling + timeout_margin_s, min_timeout_s)
+                deadline = time.monotonic() + total_wait
+                self.get_logger().info(
+                    f"Trajectory wait budget: requested={requested_duration_s:.3f}s "
+                    f"budget={total_wait:.3f}s scaling={timeout_scaling:.2f} "
+                    f"margin={timeout_margin_s:.3f}s min={min_timeout_s:.3f}s"
+                )
+                # Don't declare trajectory complete until at least half the
+                # requested duration has elapsed; otherwise a move whose start
+                # position is already within tolerance returns True instantly
+                # without the drive having moved.
+                completion_fraction = min(
+                    1.0,
+                    max(0.0, float(self.get_parameter("completion_min_duration_fraction").value)),
+                )
+                earliest_complete = time.monotonic() + completion_fraction * requested_duration_s
+                final_target_rad = float(target_rads[-1])
+
+                t_loop_start = time.monotonic()
+                iter_count = 0
+                while time.monotonic() < deadline:
+                    if self.cancel_requested.is_set():
+                        self.get_logger().warning("Trajectory cancel flag set; halting PVT")
+                        self._halt_pvt()
+                        self._set_bridge_state(BridgeState.IPM_ARMED, "trajectory canceled")
+                        return False
+
+                    iter_count += 1
+                    sw = self._read_native_statusword(warn=False)
+                    if sw is not None and cia402.sw_faulted(sw):
+                        self.get_logger().error(f"Fault during trajectory, sw=0x{sw:04X}")
+                        self._halt_pvt()
+                        self.ipm_armed = False
+                        self._set_bridge_state(BridgeState.FAULTED, "fault during trajectory")
+                        return False
+
+                    pos = self.sdo_read(cia402.IDX_POSITION_ACTUAL, 0, warn=False)
+                    if pos is None:
+                        time.sleep(0.02)
+                        continue
+                    pos_rad = self.kin.motor_qc_to_joint_unit(to_signed_32(pos))
+                    # Debug: snapshot drive state every iteration so we can see
+                    # exactly when motion happens vs the bridge's wall clock.
+                    elapsed_ms = int((time.monotonic() - t_loop_start) * 1000)
+                    buf = self.sdo_read(IDX_IPM_BUFFER_NUM_ELEMENTS, 0, warn=False)
+                    rec = self.sdo_read(IDX_IPM_RECORD_STATUS, 0, warn=False)
+                    self.get_logger().info(
+                        f"WAIT t={elapsed_ms}ms iter={iter_count} pos_qc={to_signed_32(pos)} "
+                        f"pos={pos_rad:.4f} target={final_target_rad:.4f} "
+                        f"buf={buf} rec={rec} sw=0x{sw:04X}"
+                    )
+                    in_tol = abs(final_target_rad - pos_rad) <= tolerance
+                    buf_drained = (buf is not None and buf == 0)
+                    if in_tol and buf_drained and time.monotonic() >= earliest_complete:
+                        self.get_logger().info(
+                            f"Trajectory complete: pos={pos_rad:.4f} "
+                            f"target={final_target_rad:.4f} "
+                            f"err={abs(final_target_rad - pos_rad):.4f}"
+                        )
+                        self._set_bridge_state(BridgeState.IPM_ARMED, "trajectory complete")
+                        return True
+                    time.sleep(0.02)
+
+                self.get_logger().error("Trajectory timed out before reaching tolerance")
+                self._halt_pvt()
+                self._set_bridge_state(BridgeState.IPM_ARMED, "trajectory timeout")
+                return False
+
+            except Exception as exc:
+                self.get_logger().error(f"Trajectory exception: {exc}")
+                self._halt_pvt()
+                self.ipm_armed = False
+                self._set_bridge_state(BridgeState.FAULTED, "trajectory exception")
+                return False
+
+    # ------------------------------ CAN RX ------------------------------
+
+    def _can_rx_loop(self) -> None:
+        self.get_logger().info('=== RX thread started ===')
+        _rx_total = [0]
+        _rx_tpdo2 = [0]
+        while self.rx_thread_running:
+            try:
+                msg = self.can.recv()
+            except OSError:
+                if not self.rx_thread_running:
+                    break
+                continue
+            if msg is None:
+                continue
+            can_id, data = msg
+            now_ns = self.get_clock().now().nanoseconds
+            _rx_total[0] += 1
+            if can_id == self.cob_tpdo2: _rx_tpdo2[0] += 1
+            if _rx_total[0] % 200 == 1:
+                self.get_logger().info(f'=== RX total={_rx_total[0]} tpdo2={_rx_tpdo2[0]} cob_tpdo2_expected=0x{self.cob_tpdo2:X} last_can_id=0x{can_id:X} ===')
+
+            with self.state_lock:
+                self.state.last_update_ns = now_ns
+                if can_id == self.cob_heartbeat and len(data) >= 1:
+                    self.state.heartbeat_state = data[0]
+                    self.state.bus_operational = (data[0] == 0x05)
+                elif can_id == self.cob_tpdo1 and len(data) >= 5:
+                    # 0x2185 (16) + 0x6041 (16) + 0x6061 (8) = 5 bytes, LSB-first
+                    rec = data[0] | (data[1] << 8)
+                    sw = data[2] | (data[3] << 8)
+                    mode = data[4]
+                    self.state.record_status = rec & 0xFFFF
+                    self.state.statusword = sw & 0xFFFF
+                    self.state.mode_display = mode
+                elif can_id == self.cob_tpdo2 and len(data) >= 8:
+                    pos_u32 = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24)
+                    vel_u32 = data[4] | (data[5] << 8) | (data[6] << 16) | (data[7] << 24)
+                    self.state.position_actual_qc = to_signed_32(pos_u32)
+                    self.state.velocity_actual_ct_s = to_signed_32(vel_u32)
+                    self.get_logger().info(f"TPDO2 ELIF FIRED pos_qc={self.state.position_actual_qc} len_data={len(data)}")
+                elif can_id == self.cob_emcy and len(data) >= 3:
+                    self.state.last_emcy_code = data[0] | (data[1] << 8)
+                    self.state.last_emcy_reg = data[2]
+
+    # ------------------------------ Publishers ------------------------------
+
+    def _publish_joint_state(self) -> None:
+        with self.state_lock:
+            motor_qc = self.state.position_actual_qc
+            motor_ct_s = self.state.velocity_actual_ct_s
+            faulted = cia402.sw_faulted(self.state.statusword)
+
+        if not hasattr(self, '_pcnt'):
+            self._pcnt = 0
+        self._pcnt += 1
+        if self._pcnt % 100 == 0:
+            self.get_logger().info(f'PUBLISH read_motor_qc={motor_qc} state_pos={self.state.position_actual_qc} state_id={id(self.state)}')
+        
+
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = [self.kin.joint_name]
+        msg.position = [self.kin.motor_qc_to_joint_unit(motor_qc)]
+        msg.velocity = [self.kin.motor_ct_s_to_joint_unit_s(motor_ct_s)]
+        msg.effort = []
+        self.pub_joint_states.publish(msg)
+
+        fmsg = Bool()
+        fmsg.data = bool(faulted)
+        self.pub_fault.publish(fmsg)
+
+    # ------------------------------ Startup ------------------------------
+
+    def _startup_once(self) -> None:
+        if self.startup_complete:
+            return
+        if not (self.read_cli.service_is_ready() and self.write_cli.service_is_ready()):
+            return
+        self.get_logger().info('Running one-time startup sequence')
+
+        if bool(self.get_parameter('fault_clear_on_startup').value):
+            self.clear_fault()
+
+        # NOTE: skipped mant/expo (0x21EF/0x21F0) reads -- they wedge
+        # lely's CSDO state machine on this drive. They were diagnostic-only.
+
+        if bool(self.get_parameter('force_ipm_on_startup').value):
+            self.set_mode(cia402.MODE_INTERPOLATED_POSITION)
+
+        if bool(self.get_parameter('enable_on_startup').value):
+            self.enable_operation()
+
+        self.startup_complete = True
+        self.startup_timer.cancel()
+        self._set_bridge_state(BridgeState.READY, 'startup complete')
+
+    # ------------------------------ Service handlers ------------------------------
+
+    def _srv_clear_fault(self, request, response):
+        ok = self.clear_fault()
+        response.success = bool(ok)
+        response.message = "fault cleared" if ok else "fault clear failed"
+        return response
+
+    def _srv_arm_ipm(self, request, response):
+        ok = self.startup_ipm()
+        response.success = bool(ok)
+        response.message = "IPM armed" if ok else "IPM arm failed"
+        return response
+
+    def _srv_disarm_ipm(self, request, response):
+        ok = self.disarm_ipm()
+        response.success = bool(ok)
+        response.message = "IPM disarmed" if ok else "disarm failed"
+        return response
+
+    def _srv_move_absolute_timed(self, request, response):
+        target = float(request.target_rad)
+        duration = max(0.05, float(request.duration_sec))
+        ok = self.execute_pvt_trajectory([target], [0.0], [duration])
+        if ok:
+            # Read position fresh from the drive. The cached PDO state can lag
+            # by ~100 ms, which is enough to misreport err right after the drive
+            # has just arrived at target.
+            time.sleep(0.05)
+            pos_raw = self.sdo_read(cia402.IDX_POSITION_ACTUAL, 0, warn=False)
+            if pos_raw is not None:
+                final_rad = self.kin.motor_qc_to_joint_unit(to_signed_32(pos_raw))
+            else:
+                with self.state_lock:
+                    final_rad = self.kin.motor_qc_to_joint_unit(self.state.position_actual_qc)
+            err = abs(target - final_rad)
+            response.success = err <= float(self.get_parameter("goal_position_tolerance_rad").value)
+            response.message = f"err={err:.4f} rad final={final_rad:.4f}"
+        else:
+            response.success = False
+            response.message = "execute_pvt_trajectory returned false"
+        return response
+
+    # ------------------------------ /reduced_traj ------------------------------
+
+    def _reduced_traj_cb(self, msg: Float64MultiArray) -> None:
+        data = list(msg.data)
+        if len(data) % 3 != 0 or not data:
+            self.get_logger().warning(
+                "Ignoring /reduced_traj: expected [q,v,dt,...] flat array (3*N)"
+            )
+            return
+        qs = data[0::3]
+        vs = data[1::3]
+        dts = data[2::3]
+        self.execute_pvt_trajectory(qs, vs, dts)
+
+    # ------------------------------ Action server ------------------------------
+
+    def _action_goal(self, goal_request) -> GoalResponse:
+        names = list(goal_request.trajectory.joint_names)
+        if names != [self.kin.joint_name]:
+            self.get_logger().warning(
+                f"Rejecting trajectory for joint_names={names}, expected [{self.kin.joint_name}]"
+            )
+            return GoalResponse.REJECT
+        if not goal_request.trajectory.points:
+            return GoalResponse.REJECT
+        return GoalResponse.ACCEPT
+
+    def _action_cancel(self, goal_handle) -> CancelResponse:
+        self.get_logger().warning(
+            "FollowJointTrajectory cancel requested: halting PVT manager and clearing IPM buffer"
+        )
+        self.cancel_requested.set()
+        try:
+            self._halt_pvt()
+            self._set_bridge_state(BridgeState.IPM_ARMED, "action cancel")
+        except Exception as exc:
+            self.get_logger().error(f"Cancel halt failed: {exc}")
+        return CancelResponse.ACCEPT
+
+    def _action_execute(self, goal_handle):
+        self.cancel_requested.clear()
+        traj = goal_handle.request.trajectory
+
+        if not self.ipm_armed:
+            if not self.startup_ipm():
+                goal_handle.abort()
+                result = FollowJointTrajectory.Result()
+                result.error_code = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
+                result.error_string = "Failed to arm IPM"
+                return result
+
+        qs: List[float] = []
+        vs: List[float] = []
+        dts: List[float] = []
+        prev_t = 0.0
+        for pt in traj.points:
+            t = float(pt.time_from_start.sec) + float(pt.time_from_start.nanosec) * 1e-9
+            dt = max(0.03, t - prev_t)
+            prev_t = t
+            qs.append(float(pt.positions[0]) if pt.positions else 0.0)
+            vs.append(float(pt.velocities[0]) if pt.velocities else 0.0)
+            dts.append(dt)
+
+        
+
+
+
+
+        original_point_count = len(qs)
+
+
+
+        if bool(self.get_parameter("collapse_action_trajectory_to_final_point").value) and original_point_count > 1:
+
+
+
+            total_duration = sum(max(0.0, float(d)) for d in dts)
+
+
+
+            final_q = float(qs[-1])
+
+
+
+            final_v = 0.0
+
+
+
+            if vs:
+
+
+
+                try:
+
+
+
+                    final_v = float(vs[-1])
+
+
+
+                except Exception:
+
+
+
+                    final_v = 0.0
+
+
+
+
+            max_seg_s = max(0.05, float(self.get_parameter("collapsed_action_max_segment_s").value))
+
+
+
+            max_segments = max(1, int(self.get_parameter("collapsed_action_max_segments").value))
+
+
+
+            required_segments = max(1, int(math.ceil(max(0.05, total_duration) / max_seg_s)))
+
+
+
+
+            if required_segments > max_segments:
+
+
+
+                msg = (
+
+
+
+                    f"Collapsed FJT duration {total_duration:.3f}s requires {required_segments} "
+
+
+
+                    f"segments at max_seg_s={max_seg_s:.3f}s, but max allowed is {max_segments}. "
+
+
+
+                    "Rejecting until rolling EVS FIFO flow-control is implemented."
+
+
+
+                )
+
+
+
+                self.get_logger().error(msg)
+
+
+
+                goal_handle.abort()
+
+
+
+                result = FollowJointTrajectory.Result()
+
+
+
+                result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
+
+
+
+                result.error_string = msg
+
+
+
+                return result
+
+
+
+
+            nseg = required_segments
+
+
+
+            start_q = float(qs[0])
+
+
+
+
+            split_qs = []
+
+
+
+            for i in range(1, nseg + 1):
+
+
+
+                alpha = float(i) / float(nseg)
+
+
+
+                split_qs.append(start_q + alpha * (final_q - start_q))
+
+
+
+
+            split_dt = max(0.05, total_duration / float(nseg))
+
+
+
+            qs = split_qs
+
+
+
+            vs = [0.0] * nseg
+
+
+
+            dts = [split_dt] * nseg
+
+
+
+
+            self.get_logger().warning(
+
+
+
+                f"Collapsing FJT action trajectory from {original_point_count} points "
+
+
+
+                f"to {nseg} split EVS-safe PVT segments: "
+
+
+
+                f"start={start_q:.6f} target={final_q:.6f} "
+
+
+
+                f"total_duration={total_duration:.3f}s segment_dt={split_dt:.3f}s "
+
+
+
+                f"last_vel={final_v:.6f}"
+
+
+
+            )
+
+
+
+        else:
+
+
+
+            warn_threshold = int(self.get_parameter("action_trajectory_point_warning_threshold").value)
+
+
+
+            if original_point_count > warn_threshold:
+
+
+
+                self.get_logger().warning(
+
+
+
+                    f"Executing {original_point_count} FJT points without collapse; "
+
+
+
+                    f"EVS FIFO overflow is possible until rolling buffer flow-control is implemented"
+
+
+
+                )
+
+
+
+
+        ok = self.execute_pvt_trajectory(qs, vs, dts)
+        result = FollowJointTrajectory.Result()
+
+        if self.cancel_requested.is_set() or goal_handle.is_cancel_requested:
+            self.get_logger().warning("Trajectory action completed after cancel request")
+            try:
+                self._halt_pvt()
+            except Exception as exc:
+                self.get_logger().error(f"Post-cancel halt failed: {exc}")
+            goal_handle.canceled()
+            result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
+            result.error_string = "Trajectory canceled"
+            self.cancel_requested.clear()
+            return result
+
+        if ok:
+            goal_handle.succeed()
+            result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
+        else:
+            goal_handle.abort()
+            result.error_code = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
+            result.error_string = "Trajectory execution failed"
+        return result
+
+    # ------------------------------ Shutdown ------------------------------
+
+    def destroy_node(self) -> bool:
+        self.rx_thread_running = False
+        try:
+            if self.rx_thread.is_alive():
+                self.rx_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            self.can.close()
+        except Exception:
+            pass
+        return super().destroy_node()
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = IngeniaJointBridge()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

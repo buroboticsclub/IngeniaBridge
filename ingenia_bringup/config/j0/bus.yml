@@ -1,0 +1,81 @@
+# Bus config for Ingenia EVS-XCR-C at CAN node 10, configured to expose the
+# manufacturer-specific IPM split-record path that ingenia_joint_bridge expects:
+#
+#   RPDO1  ->  0x2181 (pos i32)         + 0x2183 (time u32)
+#   RPDO2  ->  0x6040 (ctrlword)        + 0x6060 (mode of operation)
+#   RPDO3  ->  0x2182 (vel f32)         + 0x2184 (integrity check)
+#   TPDO1  ->  0x2185 (record status)   + 0x6041 (statusword) + 0x6061 (mode disp)
+#   TPDO2  ->  0x6064 (pos actual)      + 0x606C (vel actual)
+#
+# Master uses ProxyDriver only -- no Cia402 automation, the bridge drives the
+# state machine itself via raw SocketCAN.
+
+options:
+  dcf_path: "@BUS_CONFIG_PATH@"
+
+master:
+  node_id: 1
+  driver: "ros2_canopen::MasterDriver"
+  package: "canopen_master_driver"
+  sync_period: 10000
+
+nodes:
+  node_10:
+    node_id: 10
+    dcf: "evs-xcr-c_2.10.0.eds"
+    driver: "ros2_canopen::ProxyDriver"
+    package: "canopen_proxy_driver"
+    polling: true
+    period: 10
+    boot_timeout_ms: 2000
+    revision_number: 0
+
+    sdo:
+      # Interpolation time period: mantissa=1, exponent=-3  =>  1 ms units
+      - {index: 0x60C2, sub_index: 1, value: 1}
+      - {index: 0x60C2, sub_index: 2, value: -3}
+
+    tpdo:
+      1:
+        enabled: true
+        cob_id: "auto"
+        transmission: 0xFF       # async event-driven
+        mapping:
+          - {index: 0x2185, sub_index: 0}    # IPM record status
+          - {index: 0x6041, sub_index: 0}    # statusword
+          - {index: 0x6061, sub_index: 0}    # mode of operation display
+
+      2:
+        enabled: true
+        cob_id: "auto"
+        transmission: 0xFF
+        mapping:
+          - {index: 0x6064, sub_index: 0}    # position actual value
+          - {index: 0x606C, sub_index: 0}    # velocity actual value
+
+      3:
+        enabled: false
+      4:
+        enabled: false
+
+    rpdo:
+      1:
+        enabled: true
+        cob_id: "auto"
+        mapping:
+          - {index: 0x2181, sub_index: 0}    # IPM position input (signed 32)
+          - {index: 0x2183, sub_index: 0}    # IPM time input (unsigned 32)
+
+      2:
+        enabled: true
+        cob_id: "auto"
+        mapping:
+          - {index: 0x6040, sub_index: 0}    # controlword
+          - {index: 0x6060, sub_index: 0}    # mode of operation
+
+      3:
+        enabled: true
+        cob_id: "auto"
+        mapping:
+          - {index: 0x2182, sub_index: 0}    # IPM velocity input (FLOAT32)
+          - {index: 0x2184, sub_index: 0}    # IPM integrity check

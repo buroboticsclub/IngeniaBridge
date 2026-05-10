@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ingenia_bridge</name>
+  <version>0.0.1</version>
+  <description>ROS 2 bridge for Ingenia Everest EVS-XCR-C CANopen drives. Per-joint nodes that mirror the epos2_bridge / copley_bridge wire protocol so the same orchestrator can drive a mixed-vendor arm.</description>
+  <maintainer email="bostonuniversityrobotics@gmail.com">robotics-club</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>control_msgs</depend>
+  <depend>canopen_interfaces</depend>
+  <depend>action_msgs</depend>
+  <depend>std_srvs</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>epos2_bridge_interfaces</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

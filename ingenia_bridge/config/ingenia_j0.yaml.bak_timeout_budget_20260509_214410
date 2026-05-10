@@ -1,0 +1,53 @@
+# Ingenia Everest EVS-XCR-C bridge config for joint 0.
+#
+# REQUIRED OVERRIDES before running:
+#   - encoder_qc_per_motor_rev:    encoder counts per ONE motor revolution.
+#                                  For the EVS-XCR-C with a 17-bit absolute
+#                                  single-turn encoder, this is 131072.
+#   - gear_ratio_motor_per_joint_rev: motor revs per ONE joint revolution.
+#   - sign:                        +1.0 if positive joint motion = positive
+#                                  encoder counts; -1.0 to invert.
+#   - zero_offset_qc:              encoder count at joint zero (homing offset).
+#
+# OPTIONAL but commonly tuned:
+#   - integrity_check_mode:        "counter" | "constant" | "echo_pos".
+#                                  The exact protocol the drive expects on
+#                                  0x2184 isn't in our public docs; pick the
+#                                  one whose 0x2185 status comes back clean
+#                                  when you try a small move on the bench.
+#   - time_units_per_second:       must match the drive's 0x60C2 setting.
+#                                  Default Ingenia config is mantissa=1,
+#                                  exponent=-3 (so 1 ms units => 1000.0).
+#
+# The bridge will refuse to start if encoder_qc_per_motor_rev or
+# gear_ratio_motor_per_joint_rev is left at 0.0.
+
+ingenia_j0_bridge:
+  ros__parameters:
+    can_interface: "can0"
+    drive_node_id: 10
+    joint_name: "joint0"
+
+    encoder_qc_per_motor_rev: 131072.0     # 17-bit absolute single-turn
+    gear_ratio_motor_per_joint_rev: 20.0    # TODO: set from gearbox spec
+    sign: 1.0
+    zero_offset_qc: 0.0
+
+    # joint0 is a prismatic linear stage in the URDF/MoveIt.
+    # Existing gear_ratio_motor_per_joint_rev is still motor revs per pulley/output rev.
+    # 50 mm pulley diameter guess: radius = 0.025 m/rad, circumference = 0.15708 m/rev.
+    joint_interface_type: "prismatic"
+    linear_m_per_joint_rad: 0.025
+
+    joint_state_rate_hz: 50.0
+    ipm_default_segment_ms: 100
+    ipm_min_segment_ms: 20
+    goal_position_tolerance_rad: 0.002  # joint units: meters for prismatic joint0
+
+    fault_clear_on_startup: true
+    enable_on_startup: false
+    force_ipm_on_startup: false
+
+    time_units_per_second: 1000.0
+    integrity_check_mode: "counter"
+    inter_segment_sleep_s: 0.005

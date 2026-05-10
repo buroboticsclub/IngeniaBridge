@@ -1,0 +1,14 @@
+arm_trajectory_fanout:
+  ros__parameters:
+    controller_action: "/arm_controller/follow_joint_trajectory"
+
+    # Staged bringup mode:
+    # true  = accept full MoveIt trajectories and execute only mapped joints.
+    # false = reject unless every commanded joint has a mapping.
+    allow_unmapped_joints: true
+
+    client_timeout_sec: 5.0
+    result_timeout_padding_sec: 3.0
+
+    joint_mappings:
+      - "joint0:/joint0_position_controller/follow_joint_trajectory"
